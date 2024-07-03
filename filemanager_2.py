@@ -1,15 +1,19 @@
 import sys
 from PyQt5.QtGui import QCloseEvent, QIcon, QDrag, QStandardItemModel, QStandardItem
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTreeWidget, QTreeWidgetItem,\
-    QHBoxLayout, QWidget, QTreeView, QLabel, QLineEdit, QPushButton, QFileDialog
-from PyQt5.QtCore import QMimeData, Qt, QModelIndex
+    QHBoxLayout, QWidget, QTreeView, QLabel, QLineEdit, QPushButton, QFileDialog, QVBoxLayout
+from PyQt5.QtCore import QMimeData, Qt, QModelIndex, QThread, QCoreApplication
 import paramiko
-import re, os
-import logging
+import re, os, stat
+import logging, loguru
 import pytest
+import time
+import asyncio
 
-logging.basicConfig(level = logging.DEBUG, format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# logging.basicConfig(level = logging.DEBUG, format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# logger = logging.getLogger(__name__)
+
+logger = loguru.logger
 
 
 class FileInfo:
@@ -19,7 +23,7 @@ class FileInfo:
     
     def parse_description(self):
         pattern = re.compile(
-            r'(?P<permissions>[drwx\-@+]+)\s+'
+            r'(?P<permissions>[drwx\-@+.]+)\s+'
             r'(?P<links>\d+)\s+'
             r'(?P<owner>\w+)\s+'
             r'(?P<group>\w+)\s+'
@@ -61,12 +65,15 @@ class Executor:
         self.password = password
         self.ssh = None
         self.sftp = None
-        
+       
     @classmethod
     def get_instance(cls, hostname, port, username, password):
         if cls._instance is None:
             cls._instance = cls(hostname, port, username, password)
-            cls._instance.connect() # 连接
+            try:
+                cls._instance.connect() # 连接
+            except Exception as e:
+                print(e)
         return cls._instance
     
     def connect(self):
@@ -83,18 +90,81 @@ class Executor:
         if self.ssh:
             self.ssh.close()
         
-    def download(self, remote_path, local_path):
-        self.sftp.get(remotepath = remote_path, localpath=local_path)
-        logger.info('下载成功')
-        
-        
+    # def download(self, remote_path, local_path):
+    #     # self.sftp.get(remotepath = remote_path, localpath=local_path)
+    #     command = f'get -r {remote_path} {local_path}'  # 文件和文件夹都可以用递归
+    #     logger.debug(command)
+    #     stdin, stdout, stderr = self.sftp.exec_command(command)
+    #     logger.debug(stdout.read().decode())
+    #     logger.debug(stderr.read().decode())
+    #     logger.info('下载成功')
+    
+    
+    # ref: https://blog.csdn.net/RayMand168/article/details/135463557
+    def download(self, remote_path, local_path):  # eg: remote_path : /home/dir   local_path: /home/urahyou/  -> /home/urahyou/dir
+        remote_file = self.sftp.stat(remote_path)
+        if stat.S_ISDIR(remote_file.st_mode): # 如果是文件夹则要递归下载
+            self.check_local_dir(local_path)
+            logger.debug('开始下载文件夹：{}'.format(remote_path))
+            for remote_file_name in self.sftp.listdir(remote_path):
+                sub_remote_path = os.path.join(remote_path, remote_file_name)
+                sub_local_path = os.path.join(local_path, remote_file_name)
+                self.download(sub_remote_path, sub_local_path) # 递归下载
+        else:
+            # 已经到了文件就直接下载
+            logger.debug('开始下载文件：{}'.format(remote_path))
+            if self.check_local_file(local_path): 
+                logger.debug(f'{local_path} 已经存在, 跳过:')
+            else:
+                logger.debug(f'remote_path: {remote_path}, local_path: {local_path}')
+                self.sftp.get(remotepath = remote_path, localpath = local_path)
+                
+                
     def upload(self, local_path, remote_path):
-        print(f'local_path: {local_path}, remote_path: {remote_path}')
-        self.sftp.put(localpath=local_path, remotepath=remote_path)
-        logger.info('上传成功')
+        if os.path.isdir(local_path):
+            self.check_remote_dir(remote_path)
+            logger.debug('开始上传文件夹：{}'.format(local_path))
+            for local_file in os.listdir(local_path):
+                sub_remote_path = os.path.join(remote_path, local_file)
+                sub_local_path = os.path.join(local_path, local_file)
+                self.upload(sub_local_path, sub_remote_path) # 递归上传
+        else:
+            # 已经到了文件就直接上传
+            logger.debug('开始上传文件：{}'.format(local_path))
+            if self.check_remote_dir()
+            logger.debug(f'localpath: {local_path}, remote_path: {remote_path}')
+            self.sftp.put(localpath=local_path, remotepath=remote_path) 
+            
+
+    def check_remote_dir(self, remote_path):
+        remote_file_name = remote_path.split('/')[-1]
+        remote_path_parent = '/'.join(remote_path.split('/')[:-2])
+        # 如果远程不存在目录则创建
+        if remote_file_name not in self.sftp.listdir(remote_path_parent):
+            self.sftp.mkdir(remote_path)
+    
+        
+    def check_local_dir(self, local_path):
+        if not os.path.exists(local_path):
+            os.makedirs(local_path)
+            
+    def check_local_file(self, local_path):
+        if os.path.exists(local_path):
+            return True
+        else:
+            return False
+        
+    def check_remote_file(self, remote_path):
+        return False
+        
+        
+    # def upload(self, local_path, remote_path):
+    #     print(f'local_path: {local_path}, remote_path: {remote_path}')
+    #     self.sftp.put(localpath=local_path, remotepath=remote_path)
+    #     logger.info('上传成功')
         
     def local_move(self, from_path, to_path):
-        command = f"mv {from_path} {to_path}"
+        command = f"mv {from_path} {to_path}" # mv是不用加-r也可以移动文件夹的
         logger.debug(f'command: {command}')
         r = os.popen(command)
         output = r.read()
@@ -107,16 +177,16 @@ class Executor:
         if type == "remote":
             if not self.ssh:
                 raise Exception("SSH connection not established")
-            
+            # print('you are here')
             stdin, stdout, stderr = self.ssh.exec_command(command)
             output = stdout.read().decode()
             errors = stdout.read().decode()
         elif type == "local":
             # path = command.split(' ')[-1]
             # output = self.ls(path)
-            print(f'command: {command}')
+            # print(f'command: {command}')
             output = os.popen(command).read()
-            logger.debug(output)
+            # logger.debug(output)
         else:
             logger.error('type error! not a valid type (local, remote)')
            
@@ -155,7 +225,6 @@ class Utils():
         return full_path
         
             
-
 class FileTreeView(QTreeView):
     def __init__(self, root_path = '~',
                  loc = 'local',
@@ -165,7 +234,7 @@ class FileTreeView(QTreeView):
         self.root_path = root_path
         self.loc = loc
         # 获取一个统一的单例
-        self.executor = Executor.get_instance(hostname='192.168.100.113', port=22, username='urahyou', password='1mikumikukawai')
+        self.executor = Executor.get_instance(hostname='', port=22, username='', password='')
         # 连接槽函数
         self.expanded.connect(self.onItemExpand)
         
@@ -173,6 +242,9 @@ class FileTreeView(QTreeView):
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         
+        self.fileIcon = QIcon('icons/file.png')
+        self.folderIcon = QIcon('icons/folder.png')
+        self.emptyFolderIcon = QIcon('icons/empty_folder.png')
         
     def onItemExpand(self, index):
         node = self.model().itemFromIndex(index)
@@ -182,26 +254,40 @@ class FileTreeView(QTreeView):
         
         cur_full_path = Utils.get_path_from_index(self.root_path, self.model(), index)
         # print(f'cur_full_path: {cur_full_path}')
-        self.list_dir(cur_full_path, self.executor, node, type=self.loc, depth=2)
+        self.list_dir(cur_full_path,  node, loc=self.loc, depth=2)
         
     
-    def list_dir(self, path, executor, node, type, depth):
+    def list_dir(self, path, node, loc, depth):
         logger.debug(f'lisr_dir depth is {depth}')
         if depth == 0:
             print('return')
             return
         # node为根节点，列出node下面的两级目录
-        output, errors = executor.execute_command(f'ls -alh {path}', type)
-        file_infos = executor.parse_ls_output(output)
+        a = time.perf_counter()
+        output, errors = self.executor.execute_command(f'ls -alh {path}', loc)
+        b = time.perf_counter()
+        print(f'ls -alh {path} time: {b-a}')
+        a = time.perf_counter()
+        file_infos = self.executor.parse_ls_output(output)
+        b = time.perf_counter()
+        print(f'parse_ls_output time: {b-a}')
+        
         if len(file_infos) <= 3: # 文件夹下面是空的
-            node.setIcon(QIcon('./icons/empty_folder.png')) # 添加空文件夹标志
+            node.setIcon(self.emptyFolderIcon) # 添加空文件夹标志
             
-        for file_info in file_infos[3:]:
+        a = time.perf_counter()
+        # self.setUpdatesEnabled(False)
+        for i, file_info in enumerate(file_infos[3:]):
             # print(file_info)
-            self.add_file_info(path, executor, node, file_info, type, depth)
+            self.add_file_info(path, node, file_info, loc, depth)
+            if i % 100 == 99:
+                QApplication.processEvents()
+        # self.setUpdatesEnabled(True)
+        b = time.perf_counter()
+        print(f'add_file_info time: {b-a}')
                     
         
-    def add_file_info(self, path, executor, node, file_info, type, depth):
+    def add_file_info(self, path, node, file_info, loc, depth):
         name = file_info.name
         size = file_info.size
         file_type = file_info.file_type
@@ -216,22 +302,21 @@ class FileTreeView(QTreeView):
         sizeItem.setEditable(False)
         node.appendRow([nameItem, typeItem, sizeItem])
         if file_info.file_type == 'folder':
-            nameItem.setIcon(QIcon('./icons/folder.png'))
-            if depth == 1:
-                nameItem.appendRow(QStandardItem()) # 添加一个空的子节点
-                return
-            self.list_dir(path+'/'+file_info.name, executor, nameItem, type, depth-1)
+            nameItem.setIcon(self.folderIcon)
+            nameItem.appendRow(QStandardItem()) # 添加一个空的子节点
+            # self.list_dir(path+'/'+file_info.name, nameItem, type, depth-1)
         else:
-            nameItem.setIcon(QIcon('./icons/file.png')) 
+            nameItem.setIcon(self.fileIcon)
         
-            
+        
+
 class MyTreeModel(QStandardItemModel):
     def __init__(self, root_path = '~', loc='local', parent=None):
         super().__init__(parent)
         self.root_path = root_path
         self.loc = loc
         # 获取一个统一的单例
-        self.executor = Executor.get_instance(hostname='192.168.100.113', port=22, username='urahyou', password='1mikumikukawai')
+        self.executor = Executor.get_instance(hostname='', port=22, username='', password='')
         
         self.setHorizontalHeaderLabels(['name', 'type', 'size'])
 
@@ -279,7 +364,8 @@ class MyTreeModel(QStandardItemModel):
         #     logger.debug(f'key: {key}, value: {send_message[key]}')
         from_path = send_message['full_path']
         to_path = Utils.get_path_from_index(root_path = self.root_path, model=self, index=parent) + '/' + send_message['file_name']
-        
+        # to_path = Utils.get_path_from_index(root_path = self.root_path, model=self, index=parent) + '/'
+
         from_loc = send_message['from_where']
         to_loc = self.loc
         
@@ -311,39 +397,52 @@ class FileManager(QMainWindow):
     def __init__(self):
         super(FileManager, self).__init__()
         
-        hostname = 'yourhostname'
-        port = 22
-        username = 'yourusername'
-        password = '<PASSWORD>'
         
         self.setWindowTitle('FileManager')
         self.resize(1024, 768)
         # 创建两个树视图
-        self.tree_view1 = FileTreeView(root_path='/Users/urahyou/git', loc='local')
+        local_root_path = '/Users/urahyou/git'
+        remote_root_path = '/Users/urahyou/git'
+        
+        self.eidtLine1 = QLineEdit()
+        self.eidtLine1.setText(local_root_path)
+        self.eidtLine2 = QLineEdit()
+        self.eidtLine2.setText(remote_root_path)
+        
+        self.tree_view1 = FileTreeView(root_path=local_root_path, loc='local')
         self.tree_model1 = MyTreeModel(root_path=self.tree_view1.root_path, loc='local')
         self.tree_view1.setModel(self.tree_model1)
-        self.tree_view1.setColumnWidth(0, 350)
-        self.tree_view1.setColumnWidth(1, 100)
-        self.tree_view1.setColumnWidth(2, 100)
+        self.tree_view1.setColumnWidth(0, 200)
+        # self.tree_view1.setColumnWidth(1, 100)
+        # self.tree_view1.setColumnWidth(2, 100)
         
-        self.tree_view2 = FileTreeView(root_path='/Users/urahyou/git', loc='remote')
+        self.tree_view2 = FileTreeView(root_path=remote_root_path, loc='remote')
         self.tree_model2 = MyTreeModel(root_path=self.tree_view2.root_path, loc='remote')
         self.tree_view2.setModel(self.tree_model2)
-        self.tree_view2.setColumnWidth(0, 350)
-        self.tree_view2.setColumnWidth(1, 100)
-        self.tree_view2.setColumnWidth(2, 100)
+        self.tree_view2.setColumnWidth(0, 200)
+        # self.tree_view2.setColumnWidth(1, 100)
+        # self.tree_view2.setColumnWidth(2, 100)
         
-        executor = Executor(hostname=hostname, port=port, username=username, password=password)
+        # executor = Executor(hostname=hostname, port=port, username=username, password=password)
+            
+        left_layout = QVBoxLayout()
+        right_layout = QVBoxLayout()
+        
+        left_layout.addWidget(self.eidtLine1)
+        left_layout.addWidget(self.tree_view1)
+        
+        right_layout.addWidget(self.eidtLine2)
+        right_layout.addWidget(self.tree_view2)
             
         layout = QHBoxLayout()
-        layout.addWidget(self.tree_view1)
-        layout.addWidget(self.tree_view2)
+        layout.addLayout(left_layout)
+        layout.addLayout(right_layout)
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
         
-        self.tree_view1.list_dir('/Users/urahyou/git', self.tree_model1.executor, self.tree_model1, 'local', 2)
-        self.tree_view2.list_dir('/Users/urahyou/git', self.tree_model2.executor, self.tree_model2, 'remote', 2)
+        self.tree_view1.list_dir(local_root_path, self.tree_model1, 'local', 2)
+        self.tree_view2.list_dir(remote_root_path, self.tree_model2, 'remote', 2)
         
 
 if __name__ == '__main__':
